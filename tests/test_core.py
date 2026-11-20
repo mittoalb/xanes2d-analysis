@@ -1,0 +1,104 @@
+import os
+import sys
+
+import numpy as np
+import pytest
+from scipy import ndimage
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from synth import make_file                                   # noqa: E402
+from xanes2d_analysis import io, registration, spectra        # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def scan_file(tmp_path_factory):
+    p = tmp_path_factory.mktemp("d") / "scan_001.h5"
+    truth = make_file(str(p))
+    return str(p), truth
+
+
+def test_load_uses_flat_index(scan_file):
+    path, (energies, drifts, disc_a, disc_b) = scan_file
+    s = io.load_scan(path)
+    assert s.od.shape == (31, 120, 160)
+    assert np.allclose(s.energy, energies)
+    # background OD ~0.2 + texture: flat-field correction must be right
+    # (a wrong flat would leave the beam profile in the image)
+    bg = s.od[-1][~(disc_a | disc_b)]
+    assert 0.1 < np.nanmedian(bg) < 0.8
+
+
+def test_binning(scan_file):
+    s = io.load_scan(scan_file[0], binning=2)
+    assert s.od.shape == (31, 60, 80)
+
+
+def test_phase_correlation_subpixel():
+    rng = np.random.default_rng(0)
+    img = ndimage.gaussian_filter(rng.random((128, 128)), 2)
+    moved = ndimage.shift(img, (2.3, -1.7), order=3, mode="nearest")
+    shift = registration.phase_correlation(img, moved, upsample=50)
+    assert np.allclose(shift, (-2.3, 1.7), atol=0.1)
+
+
+def test_register_recovers_drift(scan_file):
+    path, (energies, drifts, *_) = scan_file
+    s = io.load_scan(path)
+    shifts = registration.register_stack(s.od, ref_index=s.n - 1, upsample=20)
+    # applying `shifts` must undo the drift: shifts ~ -drift
+    err = np.abs(shifts + drifts)
+    assert err.max() < 0.35, err.max()
+    registration.apply_shifts(s.od, shifts)
+
+
+def test_spectra_after_registration(scan_file):
+    path, (energies, drifts, disc_a, disc_b) = scan_file
+    s = io.load_scan(path)
+    registration.apply_shifts(s.od, registration.register_stack(s.od, s.n - 1))
+    core_a = ndimage.binary_erosion(disc_a, iterations=6)
+    core_b = ndimage.binary_erosion(disc_b, iterations=6)
+    spec_a = np.nanmean(s.od[:, core_a], axis=1)
+    spec_b = np.nanmean(s.od[:, core_b], axis=1)
+    e0a = spectra.edge_energy(s.energy, spec_a)
+    e0b = spectra.edge_energy(s.energy, spec_b)
+    assert abs(e0a - 8333) <= 3 and abs(e0b - 8345) <= 3, (e0a, e0b)
+    norm, e0, step = spectra.normalize(s.energy, spec_a, (8310, 8320), (8355, 8370))
+    assert abs(np.nanmean(norm[s.energy > 8360]) - 1) < 0.1
+    assert abs(np.nanmean(norm[s.energy < 8318])) < 0.05
+
+
+def test_reference_loader_text_npy_kev(tmp_path):
+    e_kev = np.linspace(8.3, 8.4, 11)
+    mu = np.linspace(0, 1, 11)
+    real = tmp_path / "a.npy"
+    np.save(real, np.column_stack([e_kev, mu]))
+    text = tmp_path / "b_calibrated.npy"            # text file with .npy name
+    text.write_text("Energy Intensity\n" + "\n".join(f"{a} {b}" for a, b in zip(e_kev, mu)))
+    csv = tmp_path / "c.csv"
+    csv.write_text("# ref\nE,mu\n" + "\n".join(f"{a*1000},{b}" for a, b in zip(e_kev, mu)))
+    for p in (real, text, csv):
+        e, m = io.load_reference(str(p))
+        assert np.allclose(e, e_kev * 1000) and np.allclose(m, mu)
+
+
+def test_r_factor_zero_for_identical():
+    e = np.linspace(0, 10, 50)
+    assert spectra.r_factor(e, np.sin(e) + 2, e, np.sin(e) + 2) == pytest.approx(0)
+
+
+def test_csv_export(tmp_path):
+    p = tmp_path / "s.csv"
+    spectra.write_csv(str(p), np.array([1.0, 2.0]), {"roi 1": [0.1, 0.2]}, ["src x.h5"])
+    txt = p.read_text().splitlines()
+    assert txt[0] == "# src x.h5" and txt[1] == "energy_eV,roi 1" and txt[2] == "1,0.1"
+
+
+def test_register_neighbour_mode(scan_file):
+    path, (energies, drifts, *_) = scan_file
+    s = io.load_scan(path)
+    shifts = registration.register_stack(s.od, ref_index=s.n // 2, mode="neighbour")
+    # relative to the middle frame: shifts[i] ~ drift[ref] - drift[i]
+    expected = drifts[s.n // 2] - drifts
+    assert np.abs(shifts - expected).max() < 0.4

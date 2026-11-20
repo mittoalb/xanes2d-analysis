@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xanes2d-analysis"
+version = "0.1.0"
+description = "XANES 2D analysis: image registration and point / region spectra for TXM XANES 2D scans"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = ["numpy", "scipy", "h5py", "PyQt5", "pyqtgraph>=0.12"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+xanes2d-analysis = "xanes2d_analysis.gui:main"
+
+[tool.setuptools]
+packages = ["xanes2d_analysis"]

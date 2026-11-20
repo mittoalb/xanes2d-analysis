@@ -1,0 +1,31 @@
+# xanes2d-analysis
+
+Analysis of XANES 2D scans from the 32-ID TXM (files written by the XANES 2D
+GUI and by pystream's DataMap).
+
+1. **Open** a XANES 2D HDF5 file. Every image is turned into absorption,
+   −ln(I/I0), using its own reference image (also when references were
+   taken only every N energies). Optional 2×/4× binning and dark level.
+2. **Register** the images: sub-pixel phase correlation of every image to a
+   reference image (or chained through neighbouring energies), optionally
+   only inside a region you place on a sharp feature. You see the shifts
+   before applying them.
+3. **Spectra**: click a point (N×N average) or add rectangle / ellipse /
+   polygon regions; each has its own spectrum, updated when you move it.
+4. **Normalize** (pre-edge line, edge step from the post-edge line) with
+   ranges you drag on the plot.
+5. **Compare** with a reference spectrum (two columns, eV or keV, text or
+   .npy — e.g. the XANES GUI `Calibrated/` curves), with an energy shift and
+   the R-factor against the selected spectrum.
+6. **Export** spectra to CSV (with ROI definitions, registration and
+   normalization settings in the header) and the aligned stack to HDF5.
+
+## Install and run
+
+```bash
+pip install .
+xanes2d-analysis                       # or: xanes2d-analysis scan_001.h5 --bin 2
+python -m xanes2d_analysis scan_001.h5
+```
+
+Tests: `pip install .[test] && pytest tests`.
