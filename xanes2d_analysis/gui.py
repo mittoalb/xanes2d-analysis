@@ -195,6 +195,16 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addWidget(self.dark)
         self.act_reload = tb.addAction("Reload", self.reload)
         tb.addSeparator()
+        self.flat_chk = QtWidgets.QCheckBox("Flat-field correction")
+        self.flat_chk.setChecked(True)
+        self.flat_chk.setToolTip(
+            "On: every image is divided by its own reference image (done at load, "
+            "before any registration), shown as −ln(I/I0).\n"
+            "Off: the raw images (minus dark), shown as −ln(I) or counts.\n"
+            "Registration shifts are applied to both, so you can switch at any time.")
+        self.flat_chk.toggled.connect(self._toggle_flat)
+        tb.addWidget(self.flat_chk)
+        tb.addSeparator()
         self.act_register = tb.addAction("Register…", self.register_dialog)
         self.act_save = tb.addAction("Save aligned stack…", self.save_aligned)
         tb.addSeparator()
@@ -279,7 +289,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot.addLegend(offset=(10, 10))
         self.plot.setLabel("bottom", "Energy", "eV")
         self.plot.getAxis("bottom").enableAutoSIPrefix(False)    # stay in eV
-        self.plot.setLabel("left", "Absorption")
+        self.plot.setLabel("left", "Absorption −ln(I/I0)")
         self.plot.showGrid(x=True, y=True, alpha=0.2)
         self.e_line = pg.InfiniteLine(angle=90, pen=pg.mkPen("#888", style=QtCore.Qt.DashLine))
         self.plot.addItem(self.e_line)
@@ -415,9 +425,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self._replot_all()
 
     # ── image ───────────────────────────────────────────────────────────
+    def _flat_on(self) -> bool:
+        return self.flat_chk.isChecked()
+
     def _frame(self, i):
-        f = self.scan.od[i]
-        return np.exp(-f) if self.display.currentIndex() == 1 else f
+        """Image i as displayed: flat-field corrected or raw, as absorption
+        or transmission / intensity."""
+        trans = self.display.currentIndex() == 1
+        if self._flat_on():
+            f = self.scan.od[i]
+            return np.exp(-f) if trans else f
+        r = self.scan.raw[i]
+        if trans:
+            return r
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return -np.log(r)
+
+    def _toggle_flat(self, on):
+        self.display.setItemText(0, "Absorption (−ln I/I0)" if on else "Absorption (−ln I), raw")
+        self.display.setItemText(1, "Transmission (I/I0)" if on else "Intensity (counts), raw")
+        if self.scan is None:
+            return
+        self._show_frame(relevel=True)
+        for sp in self.spectra:
+            self._update_spectrum(sp)
+        self._set_plot_label()
+
+    def _set_plot_label(self):
+        base = "Absorption −ln(I/I0)" if self._flat_on() else "−ln(I), no flat-field correction"
+        self.plot.setLabel("left", ("Normalized " + base[0].lower() + base[1:])
+                           if self.norm_chk.isChecked() else base)
 
     def _show_frame(self, i=None, relevel=False):
         if self.scan is None:
@@ -542,19 +579,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 legend.addItem(sp.curve, sp.name)
 
     def _extract(self, sp: Spectrum) -> np.ndarray:
-        od = self.scan.od
+        """Absorption spectrum: mean over the point / region of -ln(I/I0)
+        (flat-field corrected) or of -ln(I) (raw)."""
+        flat = self._flat_on()
+        stack = self.scan.od if flat else self.scan.raw
+        to_abs = (lambda v: v) if flat else (lambda v: -np.log(v))
+        n = stack.shape[0]
         if sp.point is not None:
             r, c = sp.point
             k = self.pt_size.value() // 2
-            block = od[:, max(0, r - k):r + k + 1, max(0, c - k):c + k + 1]
-            return np.nanmean(block.reshape(od.shape[0], -1), axis=1)
-        region = sp.roi.getArrayRegion(od, self.img, axes=(1, 2), order=0)
-        mask = sp.roi.getArrayRegion(np.ones(od.shape[1:], np.float32), self.img,
+            block = stack[:, max(0, r - k):r + k + 1, max(0, c - k):c + k + 1]
+            return np.nanmean(to_abs(block.reshape(n, -1)), axis=1)
+        region = sp.roi.getArrayRegion(stack, self.img, axes=(1, 2), order=0)
+        mask = sp.roi.getArrayRegion(np.ones(stack.shape[1:], np.float32), self.img,
                                      axes=(0, 1), order=0) > 0.5
         if region.size == 0 or not mask.any():
-            return np.full(od.shape[0], np.nan)
-        vals = region[:, mask]
-        return np.nanmean(vals, axis=1)
+            return np.full(n, np.nan)
+        return np.nanmean(to_abs(region[:, mask]), axis=1)
 
     def _update_spectrum(self, sp: Optional[Spectrum]):
         if sp is None or self.scan is None:
@@ -615,7 +656,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _toggle_norm(self, on):
         for r in (self.pre_region, self.post_region):
             (self.plot.addItem if on else self.plot.removeItem)(r)
-        self.plot.setLabel("left", "Normalized absorption" if on else "Absorption")
+        self._set_plot_label()
         self._replot_all()
         self.plot.enableAutoRange()
 
@@ -702,10 +743,13 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = "neighbour" if dlg.mode.currentIndex() == 1 else "reference"
         region = region if dlg.use_region.isChecked() else None
         smooth, up = dlg.smooth.value(), dlg.upsample.value()
-        od = self.scan.od
+        od, raw = self.scan.od, self.scan.raw
+        # Compare the images as shown (corrected or raw); the shifts are then
+        # applied to both stacks so the toggle stays consistent.
+        compare = od if self._flat_on() else raw
 
         def compute(p, s):
-            return registration.register_stack(od, ref_i, region, up, smooth, mode, p, s)
+            return registration.register_stack(compare, ref_i, region, up, smooth, mode, p, s)
 
         def computed(shifts):
             if ShiftsDialog(self, self.scan.energy, shifts).exec_() != QtWidgets.QDialog.Accepted:
@@ -713,7 +757,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
 
             def apply(p, s):
-                registration.apply_shifts(od, shifts, p)
+                n = len(shifts)
+                registration.apply_shifts(od, shifts, lambda i, _n: p(i, 2 * n))
+                registration.apply_shifts(raw, shifts, lambda i, _n: p(n + i, 2 * n))
                 return shifts
 
             def applied(sh):
@@ -757,7 +803,9 @@ class MainWindow(QtWidgets.QMainWindow):
         e = self.scan.energy
         cols, header = {}, [f"source: {self.scan.path}",
                             f"binning: {self.scan.binning}, dark: {self.scan.dark}",
-                            "absorption = -ln(I/I0)"]
+                            ("flat-field correction: on, each image divided by its own reference; "
+                             "absorption = -ln(I/I0)") if self._flat_on() else
+                            "flat-field correction: OFF (raw images); absorption = -ln(I)"]
         header.append("registration: " + ("applied, shifts (dy,dx px) per energy: " +
                       "; ".join(f"{a:.2f},{b:.2f}" for a, b in self.scan.shifts)
                       if self.scan.shifts is not None else "none"))

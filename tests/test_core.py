@@ -102,3 +102,16 @@ def test_register_neighbour_mode(scan_file):
     # relative to the middle frame: shifts[i] ~ drift[ref] - drift[i]
     expected = drifts[s.n // 2] - drifts
     assert np.abs(shifts - expected).max() < 0.4
+
+
+def test_each_image_divided_by_its_own_reference(scan_file):
+    import h5py
+    path = scan_file[0]
+    s = io.load_scan(path)
+    with h5py.File(path, "r") as f:
+        flats = f["exchange/data_flat"][:].astype(np.float32)
+        fidx = f["exchange/flat_index"][:]
+    assert np.array_equal(s.flat_index, fidx)
+    for i in (0, 1, 2, 3, 15, s.n - 1):
+        expected = -np.log(s.raw[i] / flats[fidx[i]])
+        assert np.allclose(s.od[i], expected, equal_nan=True, atol=1e-5)

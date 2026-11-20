@@ -24,7 +24,11 @@ import numpy as np
 class Scan:
     path: str
     energy: np.ndarray            # (N,) eV, increasing
-    od: np.ndarray                # (N, H, W) float32 optical density -ln(I/I0)
+    od: np.ndarray                # (N, H, W) float32 flat-field corrected
+                                  # absorption -ln(I/I0), each image ÷ its
+                                  # own reference (computed BEFORE any shift)
+    raw: np.ndarray               # (N, H, W) float32 raw intensity I (- dark)
+    flat_index: Optional[np.ndarray] = None  # (N,) reference used per image
     binning: int = 1
     dark: float = 0.0
     shifts: Optional[np.ndarray] = None    # (N, 2) dy, dx applied by registration
@@ -45,11 +49,14 @@ def _bin2d(img: np.ndarray, b: int) -> np.ndarray:
 def load_scan(path: str, binning: int = 1, dark: float = 0.0,
               progress: Optional[Callable[[int, int], None]] = None,
               stop: Optional[Callable[[], bool]] = None) -> Scan:
-    """Read a XANES 2D file and return optical-density images.
+    """Read a XANES 2D file.
 
-    OD = -ln((data - dark) / (flat - dark)); each image is divided by its own
-    reference (flat_index), or by the reference with the same index in older
-    files. Pixels where either value is <= 0 become NaN.
+    Returns both the raw images I = data - dark and the flat-field corrected
+    absorption OD = -ln(I / I0), where I0 = flat - dark is each image's own
+    reference (flat_index; the reference with the same index in older
+    files). The correction is done here, in camera coordinates, before any
+    registration: the reference is the beam profile, which does not move
+    with the sample. Pixels where either value is <= 0 give NaN.
     """
     with h5py.File(path, "r") as f:
         if "exchange/data" not in f or "exchange/data_flat" not in f:
@@ -74,7 +81,7 @@ def load_scan(path: str, binning: int = 1, dark: float = 0.0,
         info["n_flats"] = int(flat.shape[0])
 
         flats = {}                       # cache: a reference may serve many images
-        out = None
+        out = raw = None
         for i in range(n):
             if stop and stop():
                 raise InterruptedError
@@ -87,23 +94,30 @@ def load_scan(path: str, binning: int = 1, dark: float = 0.0,
             od[~np.isfinite(od)] = np.nan
             if out is None:
                 out = np.empty((n,) + od.shape, dtype=np.float32)
+                raw = np.empty((n,) + od.shape, dtype=np.float32)
             out[i] = od
+            raw[i] = d
             if progress:
                 progress(i + 1, n)
 
     order = np.argsort(energy[:n], kind="stable")
+    fidx = np.asarray(fidx[:n])
     if np.any(order != np.arange(n)):
-        out, energy = out[order], energy[:n][order]
-    return Scan(path=path, energy=energy[:n].copy(), od=out,
-                binning=binning, dark=dark, info=info)
+        out, raw, energy, fidx = out[order], raw[order], energy[:n][order], fidx[order]
+    return Scan(path=path, energy=energy[:n].copy(), od=out, raw=raw,
+                flat_index=fidx, binning=binning, dark=dark, info=info)
 
 
 def save_aligned(scan: Scan, path: str) -> None:
-    """Write the (aligned) optical-density stack and energies to HDF5."""
+    """Write the (aligned) stacks and energies to HDF5: data_od (flat-field
+    corrected absorption) and data_raw (raw intensity, same shifts)."""
     with h5py.File(path, "w") as f:
-        f.create_dataset("exchange/data_od", data=scan.od,
-                         chunks=(1,) + scan.od.shape[1:], compression="gzip",
-                         compression_opts=3)
+        for name, arr in (("data_od", scan.od), ("data_raw", scan.raw)):
+            f.create_dataset(f"exchange/{name}", data=arr,
+                             chunks=(1,) + arr.shape[1:], compression="gzip",
+                             compression_opts=3)
+        f["exchange/data_od"].attrs["content"] = "-ln(I/I0), each image ÷ its own reference"
+        f["exchange/data_raw"].attrs["content"] = "raw intensity I (minus dark), not flat-field corrected"
         f["exchange/energy"] = scan.energy
         f["exchange/energy"].attrs["units"] = "eV"
         if scan.shifts is not None:
@@ -112,7 +126,7 @@ def save_aligned(scan: Scan, path: str) -> None:
         f.attrs["source"] = scan.path
         f.attrs["binning"] = scan.binning
         f.attrs["dark"] = scan.dark
-        f.attrs["content"] = "optical density -ln(I/I0), aligned by xanes2d-analysis"
+        f.attrs["content"] = "XANES 2D stacks aligned by xanes2d-analysis"
 
 
 def load_reference(path: str):
