@@ -13,7 +13,7 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from . import io, registration, spectra
+from . import io, refs, registration, spectra
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=True)
 
@@ -154,6 +154,142 @@ class ShiftsDialog(QtWidgets.QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         v.addWidget(bb)
+
+
+class ReferenceDialog(QtWidgets.QDialog):
+    """Pick a reference spectrum from the local library (IXAS XAS Data
+    Library copy), download / update it, or open any file."""
+
+    def __init__(self, parent, scan_range=None):
+        super().__init__(parent)
+        self.setWindowTitle("Reference spectra")
+        self.resize(900, 560)
+        self.scan_range = scan_range
+        self.chosen: Optional[str] = None
+        v = QtWidgets.QVBoxLayout(self)
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(QtWidgets.QLabel("Element"))
+        self.element = QtWidgets.QComboBox()
+        self.element.currentIndexChanged.connect(self._fill)
+        top.addWidget(self.element)
+        self.in_range = QtWidgets.QCheckBox("Only spectra covering this scan's energies")
+        self.in_range.setChecked(scan_range is not None)
+        self.in_range.setEnabled(scan_range is not None)
+        self.in_range.toggled.connect(self._fill)
+        top.addWidget(self.in_range)
+        top.addStretch()
+        v.addLayout(top)
+        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Element", "Edge", "Sample", "Beamline", "File"])
+        self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.doubleClicked.connect(lambda _: self._accept_selected())
+        v.addWidget(self.table, 1)
+        self.info = QtWidgets.QLabel("")
+        self.info.setWordWrap(True)
+        v.addWidget(self.info)
+        row = QtWidgets.QHBoxLayout()
+        self.dl_btn = QtWidgets.QPushButton("Download / update library")
+        self.dl_btn.setToolTip(f"Copy the IXAS XAS Data Library ({refs.IXAS_URL}, public domain) "
+                               f"into {refs.library_dir()}. Files already there are skipped.")
+        self.dl_btn.clicked.connect(self._download)
+        row.addWidget(self.dl_btn)
+        self.dl_prog = QtWidgets.QProgressBar()
+        self.dl_prog.hide()
+        row.addWidget(self.dl_prog, 1)
+        row.addStretch()
+        b_file = QtWidgets.QPushButton("From file…")
+        b_file.clicked.connect(self._from_file)
+        row.addWidget(b_file)
+        b_ok = QtWidgets.QPushButton("Load selected")
+        b_ok.setDefault(True)
+        b_ok.clicked.connect(self._accept_selected)
+        row.addWidget(b_ok)
+        b_cancel = QtWidgets.QPushButton("Cancel")
+        b_cancel.clicked.connect(self.reject)
+        row.addWidget(b_cancel)
+        v.addLayout(row)
+        self._job = None
+        self._reload()
+
+    def _reload(self):
+        self._entries = refs.entries()
+        self._ranges = {}
+        cur = self.element.currentText()
+        self.element.blockSignals(True)
+        self.element.clear()
+        self.element.addItem("All")
+        self.element.addItems(sorted({e["element"] for e in self._entries}))
+        if cur:
+            self.element.setCurrentText(cur)
+        self.element.blockSignals(False)
+        self._fill()
+
+    def _range(self, e):
+        key = e["file"]
+        if key not in self._ranges:
+            try:
+                d = refs.read_xdi(refs.entry_path(e))
+                self._ranges[key] = (d["energy"][0], d["energy"][-1])
+            except Exception:
+                self._ranges[key] = (np.nan, np.nan)
+        return self._ranges[key]
+
+    def _fill(self):
+        el = self.element.currentText()
+        rows = [e for e in self._entries if el in ("", "All") or e["element"] == el]
+        if self.in_range.isChecked() and self.scan_range is not None:
+            lo, hi = self.scan_range
+            rows = [e for e in rows if self._range(e)[0] <= lo and self._range(e)[1] >= hi]
+        self._rows = rows
+        self.table.setRowCount(len(rows))
+        for r, e in enumerate(rows):
+            for c, txt in enumerate((e["element"], e["edge"], " ".join(e["sample"].split()),
+                                     e["beamline"], os.path.basename(e["file"]))):
+                self.table.setItem(r, c, QtWidgets.QTableWidgetItem(txt))
+        self.table.resizeColumnsToContents()
+        if not self._entries:
+            self.info.setText("The library is empty. Press 'Download / update library' "
+                              f"(about 6 MB from {refs.IXAS_URL}), or use 'From file…'.")
+        else:
+            self.info.setText(f"{len(rows)} of {len(self._entries)} spectra shown — local "
+                              f"library {refs.library_dir()} (IXAS XAS Data Library, public domain).")
+
+    def _accept_selected(self):
+        r = self.table.currentRow()
+        if 0 <= r < len(self._rows):
+            self.chosen = refs.entry_path(self._rows[r])
+            self.accept()
+
+    def _from_file(self):
+        start = next((d for d in XANES_GUI_CURVES if os.path.isdir(d)), os.getcwd())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load reference spectrum", start,
+            "Spectra (*.xdi *.npy *.txt *.dat *.csv *.xmu *.nor);;All files (*)")
+        if path:
+            self.chosen = path
+            self.accept()
+
+    def _download(self):
+        if self._job is not None and self._job.isRunning():
+            return
+        self.dl_btn.setEnabled(False)
+        self.dl_prog.show()
+        self._job = Job(lambda p, s: refs.download_ixas(log=lambda m: None, progress=p, stop=s), self)
+        self._job.progress.connect(lambda i, n: (self.dl_prog.setMaximum(n), self.dl_prog.setValue(i)))
+        self._job.result.connect(lambda n: self.info.setText(f"Downloaded {n} new spectra."))
+        self._job.failed.connect(lambda m: self.info.setText(f"Download failed: {m}"))
+        self._job.finished.connect(lambda: (self.dl_btn.setEnabled(True), self.dl_prog.hide(),
+                                            self._reload()))
+        self._job.start()
+
+    def reject(self):
+        if self._job is not None and self._job.isRunning():
+            self._job.stop()
+            self._job.wait(5000)
+        super().reject()
 
 
 # ── main window ───────────────────────────────────────────────────────────
@@ -705,12 +841,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ── reference ───────────────────────────────────────────────────────
     def load_reference_dialog(self):
-        start = next((d for d in XANES_GUI_CURVES if os.path.isdir(d)), os.getcwd())
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load reference spectrum", start,
-            "Spectra (*.npy *.txt *.dat *.csv *.xmu *.nor);;All files (*)")
-        if path:
-            self.load_reference(path)
+        rng = (self.scan.energy[0], self.scan.energy[-1]) if self.scan is not None else None
+        dlg = ReferenceDialog(self, rng)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted and dlg.chosen:
+            self.load_reference(dlg.chosen)
+
+    def start_auto_download(self):
+        """First start: fetch the reference library in the background if the
+        local copy is empty (XANES2D_NO_AUTO_DOWNLOAD=1 turns this off)."""
+        if refs.load_index() or os.environ.get("XANES2D_NO_AUTO_DOWNLOAD"):
+            return
+        self.dl_job = Job(lambda p, s: refs.download_ixas(log=lambda m: None, progress=p, stop=s), self)
+        self.dl_job.progress.connect(lambda i, n: self.statusBar().showMessage(
+            f"Downloading the reference spectra library (first start): {i}/{n}", 3000))
+        self.dl_job.result.connect(lambda n: self.statusBar().showMessage(
+            f"Reference library ready: {n} spectra in {refs.library_dir()}", 8000))
+        self.dl_job.failed.connect(lambda m: self.statusBar().showMessage(
+            f"Reference library download failed ({m}) — use Load reference… → Download later.", 8000))
+        self.dl_job.start()
 
     def load_reference(self, path):
         try:
@@ -719,8 +867,14 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Reference", f"Cannot read {path}:\n{ex}")
             return
         self.clear_reference()
-        self.ref = (e, mu, os.path.basename(path))
-        self.ref_lbl.setText(f"{os.path.basename(path)}  ({e[0]:.0f}–{e[-1]:.0f} eV, {len(e)} points)")
+        name = os.path.basename(path)
+        if refs.is_xdi(path):
+            meta = refs.read_xdi(path)["meta"]
+            sample = " ".join((meta.get("Sample.name") or meta.get("Sample.formula") or "").split())
+            if sample:
+                name = f"{meta.get('Element.symbol', '')} {meta.get('Element.edge', '')} {sample}".strip()
+        self.ref = (e, mu, name)
+        self.ref_lbl.setText(f"{name}  ({e[0]:.0f}–{e[-1]:.0f} eV, {len(e)} points)")
         self._replot_all()
 
     def clear_reference(self):
@@ -840,6 +994,7 @@ def main(argv=None):
     w.show()
     if args.file:
         w.open_file(args.file)
+    w.start_auto_download()
     return app.exec_()
 
 

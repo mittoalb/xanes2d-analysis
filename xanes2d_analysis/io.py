@@ -135,8 +135,14 @@ def load_reference(path: str):
     Accepts real .npy files and text files (space/comma/tab separated, with
     or without header lines — the XANES GUI 'Calibrated' curves are text
     files with a .npy name). Energies below 100 are taken as keV and
-    converted to eV. Returns (energy_eV, mu) sorted by energy.
+    converted to eV. XDI files (e.g. from the IXAS XAS Data Library) are
+    read with their column names, see refs.read_xdi.
+    Returns (energy_eV, mu) sorted by energy.
     """
+    from . import refs
+    if refs.is_xdi(path):
+        d = refs.read_xdi(path)
+        return d["energy"], d["mu"]
     arr = None
     if path.endswith(".npy"):
         try:

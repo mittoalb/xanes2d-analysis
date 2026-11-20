@@ -15,6 +15,7 @@ test = ["pytest"]
 
 [project.scripts]
 xanes2d-analysis = "xanes2d_analysis.gui:main"
+xanes2d-refs = "xanes2d_analysis.refs:main"
 
 [tool.setuptools]
 packages = ["xanes2d_analysis"]

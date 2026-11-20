@@ -115,3 +115,38 @@ def test_each_image_divided_by_its_own_reference(scan_file):
     for i in (0, 1, 2, 3, 15, s.n - 1):
         expected = -np.log(s.raw[i] / flats[fidx[i]])
         assert np.allclose(s.od[i], expected, equal_nan=True, atol=1e-5)
+
+
+def _xdi(tmp_path, name, cols, rows, extra=""):
+    head = "# XDI/1.0\n" + "".join(f"# Column.{i+1}: {c}\n" for i, c in enumerate(cols))
+    head += "# Element.symbol: Ni\n# Element.edge: K\n# Sample.name: test\n" + extra + "# ///\n#----\n"
+    p = tmp_path / name
+    p.write_text(head + "\n".join(" ".join(f"{v:.8g}" for v in r) for r in rows) + "\n")
+    return str(p)
+
+
+def test_xdi_reader_variants(tmp_path):
+    from xanes2d_analysis import refs
+    e = np.linspace(8300, 8400, 51)
+    mu = 0.5 + 0.5 * np.tanh((e - 8333) / 3)
+    i0 = np.full_like(e, 1e5)
+    it = i0 * np.exp(-mu)
+    # transmission from i0 / itrans
+    d = refs.read_xdi(_xdi(tmp_path, "t.xdi", ["energy eV", "i0", "itrans"], zip(e, i0, it)))
+    assert d["mu_kind"] == "ln(i0/itrans)" and np.allclose(d["mu"], mu, atol=1e-6)
+    assert d["meta"]["Element.symbol"] == "Ni"
+    # mu column wins, keV energies converted
+    d = refs.read_xdi(_xdi(tmp_path, "m.xdi", ["energy keV", "mutrans"], zip(e / 1000, mu)))
+    assert d["mu_kind"] == "mutrans" and np.allclose(d["energy"], e)
+    # fluorescence
+    d = refs.read_xdi(_xdi(tmp_path, "f.xdi", ["energy eV", "i0", "ifluor"], zip(e, i0, mu * 1e3)))
+    assert d["mu_kind"] == "ifluor/i0" and np.allclose(d["mu"], mu * 1e-2)
+    # angle column with d-spacing → energy
+    dsp = 3.1355
+    ang = np.degrees(np.arcsin(refs.HC_EV_A / (2 * dsp * e)))
+    d = refs.read_xdi(_xdi(tmp_path, "a.xdi", ["angle deg", "mutrans"], zip(ang, mu),
+                           extra=f"# Mono.d_spacing: {dsp}\n"))
+    assert np.allclose(d["energy"], e, atol=1e-3)
+    # io.load_reference recognises XDI
+    e2, mu2 = io.load_reference(str(tmp_path / "t.xdi"))
+    assert np.allclose(mu2, mu, atol=1e-6)
