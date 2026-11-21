@@ -5,7 +5,8 @@ xanes2d-analysis's). It only needs numpy, Pillow, torch and sam3:
 
 request.json: {"image_path": .npy (H, W) float, "prompt": str,
                "out_masks": .npy path, "out_info": .json path,
-               "checkpoint": optional path}
+               "checkpoint": optional path, "min_score": float,
+               "device": "auto" | "cuda" | "cpu"}
 Writes the instance masks (K, H, W) bool and {"scores": [...]} .
 """
 
@@ -42,11 +43,22 @@ def main(path):
     from sam3.model.sam3_image_processor import Sam3Processor
 
     img = np.load(req["image_path"])
-    kwargs = {}
+    device = req.get("device") or "auto"
+    if device == "auto":
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            device = "cpu"
+    kwargs = {"device": device}
     if req.get("checkpoint"):
-        kwargs["checkpoint_path"] = req["checkpoint"]
+        kwargs["checkpoint_path"] = req["checkpoint"]      # else sam3.pt from facebook/sam3
     model = build_sam3_image_model(**kwargs)
-    processor = Sam3Processor(model)
+    # Sam3Processor defaults to device="cuda" whatever the model's device,
+    # and drops objects below its own confidence_threshold (default 0.5):
+    # pass both explicitly.
+    processor = Sam3Processor(model, device=device,
+                              confidence_threshold=float(req.get("min_score", 0.5)))
     state = processor.set_image(Image.fromarray(_to_rgb_uint8(img)))
     out = processor.set_text_prompt(state=state, prompt=req.get("prompt") or "particle")
     masks = _to_np(out["masks"]).astype(bool)
@@ -57,7 +69,7 @@ def main(path):
         masks = masks[None]
     np.save(req["out_masks"], masks)
     with open(req["out_info"], "w") as fh:
-        json.dump({"scores": scores.tolist(), "n": int(masks.shape[0])}, fh)
+        json.dump({"scores": scores.tolist(), "n": int(masks.shape[0]), "device": device}, fh)
     return 0
 
 

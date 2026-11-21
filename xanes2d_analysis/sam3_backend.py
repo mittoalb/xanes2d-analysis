@@ -29,9 +29,9 @@ _CANDIDATES = ["~/miniconda3/envs/sam3/bin/python", "~/anaconda3/envs/sam3/bin/p
 SETUP_HELP = (
     "SAM 3 needs its own environment on a computer with a recent NVIDIA GPU:\n"
     "  conda create -n sam3 python=3.12 && conda activate sam3\n"
-    "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128\n"
+    "  pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu128\n"
     "  git clone https://github.com/facebookresearch/sam3.git && pip install -e sam3\n"
-    "  request access at https://huggingface.co/facebook/sam3, then: hf auth login\n"
+    "  request access at https://huggingface.co/facebook/sam3, then (in that env): hf auth login\n"
     "Then set its Python in 'SAM 3 settings' (or $XANES2D_SAM3_PYTHON).")
 
 
@@ -62,7 +62,8 @@ def segment(image: np.ndarray, prompt: str = "particle", python: Optional[str] =
     with tempfile.TemporaryDirectory(prefix="xanes2d_sam3_") as td:
         req = {"image_path": os.path.join(td, "image.npy"), "prompt": prompt,
                "out_masks": os.path.join(td, "masks.npy"),
-               "out_info": os.path.join(td, "info.json"), "checkpoint": checkpoint}
+               "out_info": os.path.join(td, "info.json"), "checkpoint": checkpoint,
+               "min_score": float(min_score), "device": "auto"}
         np.save(req["image_path"], np.asarray(image, dtype=np.float32))
         rpath = os.path.join(td, "request.json")
         with open(rpath, "w") as fh:

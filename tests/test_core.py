@@ -218,8 +218,12 @@ def test_sam3_backend_plumbing_with_stand_in():
     s = io.load_scan(p)
     img = bgm.contrast_image(s.energy, s.od, (8355, 8370))
     env = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(__file__), "fake_sam3"))
-    mask, n, scores = sb.segment(img, "particle", python=sys.executable, env=env)
+    # stand-in scores the two objects 0.95 and 0.40: min_score reaches the
+    # processor's own confidence threshold
+    mask, n, scores = sb.segment(img, "particle", python=sys.executable, env=env, min_score=0.3)
     truth = disc_a | disc_b
     assert n == 2 and (mask & truth).sum() / (mask | truth).sum() > 0.95
+    mask, n, scores = sb.segment(img, "particle", python=sys.executable, env=env, min_score=0.5)
+    assert n == 1
     with pytest.raises(RuntimeError, match="SAM 3"):
         sb.segment(img, python="/nonexistent/python")
