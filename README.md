@@ -1,5 +1,8 @@
 # xanes2d-analysis
 
+**User guide:** section "xanes2d-analysis" of the 32-ID TXM Software User
+Guide (https://github.com/mittoalb/32id-gui-docs, `docs/xanes2d_analysis/`).
+
 Analysis of XANES 2D scans from the 32-ID TXM (files written by the XANES 2D
 GUI and by pystream's DataMap).
 
@@ -18,7 +21,11 @@ GUI and by pystream's DataMap).
    R-factor against the selected spectrum. **Load reference…** opens the
    local reference library (see below), or any file: XDI, or two columns
    (eV or keV, text or .npy — e.g. the XANES GUI `Calibrated/` curves).
-6. **Export** spectra to CSV (with ROI definitions, registration and
+6. **Save / load shifts** (CSV, full-resolution pixels vs energy) to reuse
+   one scan's registration on other scans that drift the same way.
+7. **Edge-energy and edge-step maps** (per-pixel half-step energy / edge
+   jump, with masking), and a scale bar.
+8. **Export** spectra to CSV (with ROI definitions, registration and
    normalization settings in the header) and the aligned stack to HDF5.
 
 ## Install and run
