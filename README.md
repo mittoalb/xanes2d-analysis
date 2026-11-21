@@ -1,7 +1,10 @@
 # xanes2d-analysis
 
-**User guide:** section "xanes2d-analysis" of the 32-ID TXM Software User
-Guide (https://github.com/mittoalb/32id-gui-docs, `docs/xanes2d_analysis/`).
+**User guide:** in [`docs/`](docs/index.md) (build: `pip install .[docs] &&
+sphinx-build -b html docs docs/_build/html`; Read the Docs config included).
+The same pages are the "xanes2d-analysis" section of the 32-ID TXM Software
+User Guide (https://github.com/mittoalb/32id-gui-docs); edit them here and
+copy them over with `tools/sync_docs.sh`.
 
 Analysis of XANES 2D scans from the 32-ID TXM (files written by the XANES 2D
 GUI and by pystream's DataMap).
