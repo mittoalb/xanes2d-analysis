@@ -25,7 +25,10 @@ GUI and by pystream's DataMap).
    one scan's registration on other scans that drift the same way.
 7. **Edge-energy and edge-step maps** (per-pixel half-step energy / edge
    jump, with masking), and a scale bar.
-8. **Export** spectra to CSV (with ROI definitions, registration and
+8. **Background removal**: find the sample in the post-edge mean
+   (automatic threshold, or **SAM 3** with a text prompt), subtract the
+   per-energy background level, hide the background.
+9. **Export** spectra to CSV (with ROI definitions, registration and
    normalization settings in the header) and the aligned stack to HDF5.
 
 ## Install and run
@@ -35,6 +38,22 @@ pip install .
 xanes2d-analysis                       # or: xanes2d-analysis scan_001.h5 --bin 2
 python -m xanes2d_analysis scan_001.h5
 ```
+
+## SAM 3 (optional)
+
+Find sample can use Meta's SAM 3, run from its own environment (Python
+>= 3.12, PyTorch, CUDA GPU, Hugging Face access to facebook/sam3):
+
+```bash
+conda create -n sam3 python=3.12 && conda activate sam3
+pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu128
+git clone https://github.com/facebookresearch/sam3.git && pip install -e sam3
+hf auth login
+```
+
+Then set **SAM 3 Python** in the app (Background → SAM 3 → …) or
+`XANES2D_SAM3_PYTHON`. Full instructions: user guide, page
+"Setting up and using SAM 3".
 
 ## Reference spectra library
 
