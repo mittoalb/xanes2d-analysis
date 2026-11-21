@@ -179,3 +179,28 @@ def test_shifts_roundtrip_binning_and_interpolation(tmp_path):
     s1, out = io.shifts_for_scan(np.array([8305.0, 8340.0]), 1, e2, full)
     assert out == 1
     assert np.allclose(s1[0], [1.5, -1.0]) and np.allclose(s1[1], full[-1])
+
+
+def test_segmentation_and_background_removal(tmp_path):
+    from xanes2d_analysis import background as bgm
+    p = tmp_path / "flux_001.h5"
+    energies, drifts, disc_a, disc_b = make_file(str(p), flux_jitter=0.05, drift_px=0)
+    s = io.load_scan(str(p))
+    img = bgm.contrast_image(s.energy, s.od, (8355, 8370))
+    mask = bgm.segment_sample(img, bgm.otsu_threshold(img))
+    truth = disc_a | disc_b
+    iou = (mask & truth).sum() / (mask | truth).sum()
+    assert iou > 0.9, iou
+    bg = bgm.background_pixels(mask)
+    levels = bgm.background_levels(s.od, bg)
+    # the per-energy flux jitter is an OD offset of -ln(flux): background
+    # levels must follow it, and after subtraction the background is ~0
+    corrected = s.od - levels[:, None, None]
+    assert abs(np.nanmedian(corrected[:, bg])) < 0.01
+    core = ndimage.binary_erosion(disc_a, iterations=6)
+    raw_spec = np.nanmean(s.od[:, core], axis=1)
+    cor_spec = np.nanmean(corrected[:, core], axis=1)
+    # pre-edge part of phase A is flat in truth: jitter makes it wavy,
+    # background removal flattens it
+    pre = s.energy < 8322
+    assert np.std(cor_spec[pre]) < 0.3 * np.std(raw_spec[pre])

@@ -16,7 +16,10 @@ def edge(e, e0, width=2.0, step=1.0, white=0.4):
     return step * s + white * np.exp(-((e - e0 - 3) / 3.0) ** 2)
 
 
-def make_file(path, n_e=31, shape=(120, 160), ref_every=3, drift_px=3.0, seed=1):
+def make_file(path, n_e=31, shape=(120, 160), ref_every=3, drift_px=3.0, seed=1,
+              flux_jitter=0.0):
+    """flux_jitter: relative beam-intensity change between each image and its
+    reference (random per energy) — shows up as an OD offset per energy."""
     rng = np.random.default_rng(seed)
     energies = np.linspace(8310, 8370, n_e)
     h, w = shape
@@ -27,6 +30,7 @@ def make_file(path, n_e=31, shape=(120, 160), ref_every=3, drift_px=3.0, seed=1)
     beam = 20000 * (0.7 + 0.3 * np.exp(-((xx - w / 2) ** 2 + (yy - h / 2) ** 2) / (2 * (w / 2) ** 2)))
 
     drifts = rng.uniform(-drift_px, drift_px, size=(n_e, 2))
+    flux = 1.0 + flux_jitter * rng.standard_normal(n_e)
     drifts[n_e - 1] = 0.0                                            # last frame = reference
     data, flats, fidx, e_flat = [], [], [], []
     for i, e in enumerate(energies):
@@ -38,7 +42,7 @@ def make_file(path, n_e=31, shape=(120, 160), ref_every=3, drift_px=3.0, seed=1)
             flats.append(beam * (1 + 0.005 * rng.standard_normal(shape)))
             e_flat.append(e)
         fidx.append(len(flats) - 1)
-        data.append(rng.poisson(beam * np.exp(-od)).astype(np.uint16))
+        data.append(rng.poisson(flux[i] * beam * np.exp(-od)).astype(np.uint16))
     with h5py.File(path, "w") as f:
         f["exchange/data"] = np.array(data)
         f["exchange/data_flat"] = np.array(flats).astype(np.uint16)

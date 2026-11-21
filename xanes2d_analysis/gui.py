@@ -13,6 +13,7 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from . import background as bgm
 from . import io, refs, registration, spectra
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=True)
@@ -452,6 +453,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._levels_set = False
         self._n_roi = 0
         self._maps = None                          # (step, edge energy) cache
+        self.sample_mask: Optional[np.ndarray] = None
+        self._contrast = None                      # post-edge mean used to segment
+        self._bg_cache = {}                        # flat-field on/off → (N,) levels
         self.scalebar = None
         self.sb_cfg = load_scalebar_settings()
         self._build()
@@ -581,6 +585,45 @@ class MainWindow(QtWidgets.QMainWindow):
         crow.addWidget(self.sb_btn)
         lv.addLayout(crow)
 
+        brow = QtWidgets.QHBoxLayout()
+        brow.addWidget(QtWidgets.QLabel("Background:"))
+        self.btn_find = QtWidgets.QPushButton("Find sample")
+        self.btn_find.setToolTip("Segment the sample in the mean of the post-edge images (red "
+                                 "range on the plot) with an automatic (Otsu) threshold.")
+        self.btn_find.clicked.connect(self.find_sample)
+        brow.addWidget(self.btn_find)
+        brow.addWidget(QtWidgets.QLabel("Threshold"))
+        self.thr = QtWidgets.QDoubleSpinBox()
+        self.thr.setRange(-100, 100)
+        self.thr.setDecimals(3)
+        self.thr.setSingleStep(0.01)
+        self.thr.setToolTip("Pixels above this (post-edge mean absorption, lightly smoothed) "
+                            "are sample. Set automatically by Find sample.")
+        self.thr.valueChanged.connect(lambda _: self._segment())
+        brow.addWidget(self.thr)
+        self.bg_sub = QtWidgets.QCheckBox("Subtract background")
+        self.bg_sub.setToolTip("At every energy subtract the median absorption of the background "
+                               "(away from the sample): empty areas become 0, and beam-intensity "
+                               "changes between image and reference are removed.")
+        self.bg_sub.toggled.connect(lambda _: self._bg_changed())
+        brow.addWidget(self.bg_sub)
+        self.bg_hide = QtWidgets.QCheckBox("Hide background")
+        self.bg_hide.setToolTip("Blank everything outside the sample in the image and the maps.")
+        self.bg_hide.toggled.connect(lambda _: self._bg_changed(spectra_too=False))
+        brow.addWidget(self.bg_hide)
+        self.bg_outline = QtWidgets.QCheckBox("Outline")
+        self.bg_outline.setChecked(True)
+        self.bg_outline.toggled.connect(lambda _: self._draw_outline())
+        brow.addWidget(self.bg_outline)
+        self.bg_info = QtWidgets.QLabel("")
+        self.bg_info.setStyleSheet("color: #888;")
+        brow.addWidget(self.bg_info)
+        brow.addStretch()
+        lv.addLayout(brow)
+        self.outline_img = pg.ImageItem()
+        self.outline_img.setZValue(5)
+        self.vb.addItem(self.outline_img)
+
         rrow = QtWidgets.QHBoxLayout()
         for text, kind in (("+ Rectangle", "rect"), ("+ Ellipse", "ellipse"),
                            ("+ Polygon", "polygon")):
@@ -675,11 +718,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_enabled(self, on: bool):
         for w in (self.act_reload, self.act_register, self.act_save, self.act_export,
-                  self.act_save_shifts, self.act_load_shifts,
+                  self.act_save_shifts, self.act_load_shifts, self.btn_find,
                   self.btn_rect, self.btn_ellipse, self.btn_polygon, self.btn_keep,
                   self.btn_remove, self.reg_region_chk, self.norm_chk, self.slider,
                   self.sb_chk, self.sb_btn):
             w.setEnabled(on)
+        self._bg_controls()
         self._map_controls()
 
     # ── jobs ────────────────────────────────────────────────────────────
@@ -733,6 +777,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._n_roi = 0
         self._levels_set = False
         self._maps = None
+        self._reset_background()
         self.slider.blockSignals(True)
         self.slider.setRange(0, scan.n - 1)
         self.slider.setValue(scan.n - 1)
@@ -755,14 +800,19 @@ class MainWindow(QtWidgets.QMainWindow):
         """Image i as displayed: flat-field corrected or raw, as absorption
         or transmission / intensity."""
         trans = self.display.currentIndex() == 1
-        if self._flat_on():
-            f = self.scan.od[i]
-            return np.exp(-f) if trans else f
-        r = self.scan.raw[i]
-        if trans:
-            return r
+        b = self._bg_levels()
+        b = 0.0 if b is None else float(b[i])
         with np.errstate(divide="ignore", invalid="ignore"):
-            return -np.log(r)
+            if self._flat_on():
+                f = self.scan.od[i] - b
+                out = np.exp(-f) if trans else f
+            elif trans:
+                out = self.scan.raw[i] * np.exp(b)      # I / I_background when subtracting
+            else:
+                out = -np.log(self.scan.raw[i]) - b
+        if self.bg_hide.isChecked() and self.sample_mask is not None:
+            out = np.where(self.sample_mask, out, np.nan)
+        return out
 
     def _toggle_flat(self, on):
         self.display.setItemText(0, "Absorption (−ln I/I0)" if on else "Absorption (−ln I), raw")
@@ -770,6 +820,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.scan is None:
             return
         self._maps = None
+        if self.sample_mask is not None:
+            self.find_sample()           # other quantity → new threshold and mask
         self._show_frame(relevel=True)
         for sp in self.spectra:
             self._update_spectrum(sp)
@@ -812,11 +864,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._maps is None and self.scan is not None:
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
             try:
-                if self._flat_on():
-                    stack = self.scan.od
-                else:
-                    with np.errstate(divide="ignore", invalid="ignore"):
-                        stack = -np.log(self.scan.raw)
+                stack = self._active_abs_stack()
+                b = self._bg_levels()
+                if b is not None:
+                    stack = stack - b[:, None, None]
                 self._maps = spectra.edge_maps(self.scan.energy, stack,
                                                self.pre_region.getRegion(),
                                                self.post_region.getRegion())
@@ -826,11 +877,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _map_image(self):
         step, e_half = self._get_maps()
+        hide = self.bg_hide.isChecked() and self.sample_mask is not None
         if self._map_mode() == 2:
-            return step
+            return np.where(self.sample_mask, step, np.nan) if hide else step
         ref = np.nanpercentile(step, 99) if np.isfinite(step).any() else 0
         out = e_half.copy()
         out[~(step >= ref * self.mask.value() / 100.0)] = np.nan
+        if hide:
+            out[~self.sample_mask] = np.nan
         return out
 
     def _show_frame(self, i=None, relevel=False):
@@ -864,6 +918,87 @@ class MainWindow(QtWidgets.QMainWindow):
         self.e_lbl.setText(f"{self.scan.energy[i]:.2f} eV  ({i + 1}/{self.scan.n})")
         self.e_line.show()
         self.e_line.setValue(self.scan.energy[i])
+
+    # ── background ──────────────────────────────────────────────────────
+    def _bg_controls(self):
+        has = self.sample_mask is not None
+        for wdg in (self.thr, self.bg_sub, self.bg_hide, self.bg_outline):
+            wdg.setEnabled(has)
+
+    def _active_abs_stack(self):
+        """The absorption stack currently in use: -ln(I/I0) or -ln(I)."""
+        if self._flat_on():
+            return self.scan.od
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return -np.log(self.scan.raw)
+
+    def find_sample(self):
+        if self.scan is None:
+            return
+        self._contrast = bgm.contrast_image(self.scan.energy, self._active_abs_stack(),
+                                            self.post_region.getRegion())
+        t = bgm.otsu_threshold(self._contrast)
+        self.thr.blockSignals(True)
+        self.thr.setValue(t)
+        self.thr.blockSignals(False)
+        self._segment()
+
+    def _segment(self):
+        if self.scan is None or self._contrast is None:
+            return
+        self.sample_mask = bgm.segment_sample(self._contrast, self.thr.value())
+        self._bg_cache = {}
+        frac = 100.0 * self.sample_mask.mean()
+        nbg = int(bgm.background_pixels(self.sample_mask).sum())
+        self.bg_info.setText(f"sample {frac:.0f}% of image, {nbg} background px")
+        self._bg_controls()
+        self._draw_outline()
+        self._bg_changed()
+
+    def _draw_outline(self):
+        if self.sample_mask is None or not self.bg_outline.isChecked():
+            self.outline_img.clear()
+            return
+        from scipy import ndimage
+        m = self.sample_mask
+        edge = m & ~ndimage.binary_erosion(m)
+        rgba = np.zeros(m.shape + (4,), np.ubyte)
+        rgba[edge] = (0, 255, 255, 255)
+        self.outline_img.setImage(rgba, levels=(0, 255))
+
+    def _bg_levels(self) -> Optional[np.ndarray]:
+        """Per-energy background absorption when 'Subtract background' is on."""
+        if self.sample_mask is None or not self.bg_sub.isChecked():
+            return None
+        key = self._flat_on()
+        if key not in self._bg_cache:
+            bg = bgm.background_pixels(self.sample_mask)
+            self._bg_cache[key] = bgm.background_levels(self._active_abs_stack(), bg)
+        return self._bg_cache[key]
+
+    def _bg_changed(self, spectra_too=True):
+        if self.scan is None:
+            return
+        self._maps = None
+        self._show_frame(relevel=True)
+        if spectra_too:
+            for sp in self.spectra:
+                self._update_spectrum(sp)
+
+    def _reset_background(self, keep_threshold=False):
+        """Mask and levels are stale (new scan / registration): drop them, or
+        re-segment with the same threshold."""
+        self._bg_cache = {}
+        if keep_threshold and self.sample_mask is not None and self.scan is not None:
+            self._contrast = bgm.contrast_image(self.scan.energy, self._active_abs_stack(),
+                                                self.post_region.getRegion())
+            self._segment()
+            return
+        self.sample_mask = None
+        self._contrast = None
+        self.outline_img.clear()
+        self.bg_info.setText("")
+        self._bg_controls()
 
     # ── scale bar ───────────────────────────────────────────────────────
     def scalebar_dialog(self):
@@ -1034,6 +1169,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         with np.errstate(all="ignore"):
             sp.values = self._extract(sp)
+            b = self._bg_levels()
+            if b is not None:
+                sp.values = sp.values - b
         self._replot(sp)
         self._update_rfactor()
 
@@ -1227,6 +1365,7 @@ class MainWindow(QtWidgets.QMainWindow):
             prev = self.scan.shifts
             self.scan.shifts = sh if prev is None else prev + sh
             self._maps = None
+            self._reset_background(keep_threshold=True)   # sample moved: re-segment
             self._show_frame()
             for sp in self.spectra:
                 self._update_spectrum(sp)
@@ -1304,6 +1443,12 @@ class MainWindow(QtWidgets.QMainWindow):
         header.append("registration: " + ("applied, shifts (dy,dx px) per energy: " +
                       "; ".join(f"{a:.2f},{b:.2f}" for a, b in self.scan.shifts)
                       if self.scan.shifts is not None else "none"))
+        b = self._bg_levels()
+        if b is not None:
+            nbg = int(bgm.background_pixels(self.sample_mask).sum())
+            header.append(f"background: subtracted per energy (median of {nbg} background px; "
+                          f"sample threshold {self.thr.value():.4g} on the post-edge mean); "
+                          "column 'background' = subtracted level")
         norm = self.norm_chk.isChecked()
         if norm:
             header.append(f"normalization: pre-edge {self.pre_region.getRegion()}, "
@@ -1318,6 +1463,8 @@ class MainWindow(QtWidgets.QMainWindow):
             header.append(f"reference: {self.ref[2]}, energy shift {self.ref_shift.value():.2f} eV"
                           + (" (normalized)" if norm else ""))
             cols["reference"] = np.interp(e, e_ref, mu_ref, left=np.nan, right=np.nan)
+        if b is not None:
+            cols["background"] = b
         spectra.write_csv(path, e, cols, header)
         self.statusBar().showMessage(f"Exported {len(shown)} spectra to {path}")
 
