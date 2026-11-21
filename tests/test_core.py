@@ -163,3 +163,19 @@ def test_edge_maps_separate_the_two_phases(scan_file):
     assert abs(np.nanmedian(e_half[a]) - 8333) < 3
     assert abs(np.nanmedian(e_half[b]) - 8345) < 3
     assert np.nanmedian(step[a]) > 0.6 and abs(np.nanmedian(step[bg])) < 0.1
+
+
+def test_shifts_roundtrip_binning_and_interpolation(tmp_path):
+    e = np.array([8300.0, 8310.0, 8320.0, 8330.0])
+    sh_bin2 = np.array([[0.5, -1.0], [1.0, 0.0], [0.0, 0.25], [0.0, 0.0]])
+    p = tmp_path / "shifts.csv"
+    io.save_shifts(str(p), e, sh_bin2, binning=2, header=["source: x.h5"])
+    e2, full = io.load_shifts(str(p))
+    assert np.allclose(e2, e) and np.allclose(full, sh_bin2 * 2)      # stored full-res
+    # same energies, binning 4 → half of the binning-2 values
+    s4, out = io.shifts_for_scan(e, 4, e2, full)
+    assert out == 0 and np.allclose(s4, sh_bin2 / 2)
+    # other energies: interpolated; outside the saved range → nearest value
+    s1, out = io.shifts_for_scan(np.array([8305.0, 8340.0]), 1, e2, full)
+    assert out == 1
+    assert np.allclose(s1[0], [1.5, -1.0]) and np.allclose(s1[1], full[-1])

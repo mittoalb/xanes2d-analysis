@@ -489,6 +489,12 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addWidget(self.flat_chk)
         tb.addSeparator()
         self.act_register = tb.addAction("Register…", self.register_dialog)
+        self.act_save_shifts = tb.addAction("Save shifts…", self.save_shifts_dialog)
+        self.act_save_shifts.setToolTip("Save the registration shifts (full-resolution pixels "
+                                        "vs energy) to reuse them on other scans")
+        self.act_load_shifts = tb.addAction("Load shifts…", self.load_shifts_dialog)
+        self.act_load_shifts.setToolTip("Apply shifts saved from another scan (matched by "
+                                        "energy, converted to this binning)")
         self.act_save = tb.addAction("Save aligned stack…", self.save_aligned)
         tb.addSeparator()
         self.act_ref = tb.addAction("Load reference…", self.load_reference_dialog)
@@ -669,6 +675,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_enabled(self, on: bool):
         for w in (self.act_reload, self.act_register, self.act_save, self.act_export,
+                  self.act_save_shifts, self.act_load_shifts,
                   self.btn_rect, self.btn_ellipse, self.btn_polygon, self.btn_keep,
                   self.btn_remove, self.reg_region_chk, self.norm_chk, self.slider,
                   self.sb_chk, self.sb_btn):
@@ -1199,28 +1206,68 @@ class MainWindow(QtWidgets.QMainWindow):
             return registration.register_stack(compare, ref_i, region, up, smooth, mode, p, s)
 
         def computed(shifts):
-            if ShiftsDialog(self, self.scan.energy, shifts).exec_() != QtWidgets.QDialog.Accepted:
-                self.statusBar().showMessage("Registration discarded.")
-                return
-
-            def apply(p, s):
-                n = len(shifts)
-                registration.apply_shifts(od, shifts, lambda i, _n: p(i, 2 * n))
-                registration.apply_shifts(raw, shifts, lambda i, _n: p(n + i, 2 * n))
-                return shifts
-
-            def applied(sh):
-                prev = self.scan.shifts
-                self.scan.shifts = sh if prev is None else prev + sh
-                self._maps = None
-                self._show_frame()
-                for sp in self.spectra:
-                    self._update_spectrum(sp)
-                self.statusBar().showMessage(
-                    f"Registered to image {ref_i + 1} ({self.scan.energy[ref_i]:.1f} eV); "
-                    f"largest shift {np.abs(sh).max():.2f} px.")
-            self._run("Applying shifts…", apply, applied)
+            self._preview_and_apply(
+                shifts, f"Registered to image {ref_i + 1} ({self.scan.energy[ref_i]:.1f} eV)")
         self._run("Registering…", compute, computed)
+
+    def _preview_and_apply(self, shifts, what: str):
+        """Show the shifts; on Apply, shift both stacks (corrected and raw)."""
+        if ShiftsDialog(self, self.scan.energy, shifts).exec_() != QtWidgets.QDialog.Accepted:
+            self.statusBar().showMessage("Shifts discarded.")
+            return
+        od, raw = self.scan.od, self.scan.raw
+
+        def apply(p, s):
+            n = len(shifts)
+            registration.apply_shifts(od, shifts, lambda i, _n: p(i, 2 * n))
+            registration.apply_shifts(raw, shifts, lambda i, _n: p(n + i, 2 * n))
+            return shifts
+
+        def applied(sh):
+            prev = self.scan.shifts
+            self.scan.shifts = sh if prev is None else prev + sh
+            self._maps = None
+            self._show_frame()
+            for sp in self.spectra:
+                self._update_spectrum(sp)
+            self.statusBar().showMessage(f"{what}; largest shift {np.abs(sh).max():.2f} px.")
+        self._run("Applying shifts…", apply, applied)
+
+    def save_shifts_dialog(self):
+        if self.scan is None or self.scan.shifts is None:
+            QtWidgets.QMessageBox.information(self, "Save shifts",
+                                              "No shifts yet: register the images first.")
+            return
+        base = os.path.splitext(self.scan.path)[0] + "_shifts.csv"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save shifts", base,
+                                                        "CSV (*.csv);;Text (*.txt)")
+        if not path:
+            return
+        io.save_shifts(path, self.scan.energy, self.scan.shifts, self.scan.binning,
+                       [f"source: {self.scan.path}",
+                        f"registered at binning {self.scan.binning} (values here are full resolution)"])
+        self.statusBar().showMessage(f"Saved shifts to {path}")
+
+    def load_shifts_dialog(self):
+        if self.scan is None:
+            return
+        start = os.path.dirname(self.scan.path)
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load shifts", start,
+                                                        "CSV (*.csv *.txt);;All files (*)")
+        if path:
+            self.load_shifts(path)
+
+    def load_shifts(self, path):
+        try:
+            e_saved, full = io.load_shifts(path)
+        except Exception as ex:
+            QtWidgets.QMessageBox.warning(self, "Load shifts", f"Cannot read {path}:\n{ex}")
+            return
+        shifts, outside = io.shifts_for_scan(self.scan.energy, self.scan.binning, e_saved, full)
+        what = f"Applied shifts from {os.path.basename(path)}"
+        if outside:
+            what += f" ({outside} energies outside the saved range used the nearest value)"
+        self._preview_and_apply(shifts, what)
 
     def save_aligned(self):
         if self.scan is None:

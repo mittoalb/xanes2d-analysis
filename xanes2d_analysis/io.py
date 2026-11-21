@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import h5py
 import numpy as np
@@ -179,3 +179,52 @@ def load_reference(path: str):
         e = e * 1000.0
     order = np.argsort(e)
     return e[order], mu[order]
+
+
+def save_shifts(path: str, energy: np.ndarray, shifts_binned: np.ndarray,
+                binning: int, header: Sequence[str] = ()) -> None:
+    """Registration shifts as CSV: energy_eV, dy_px, dx_px in FULL-resolution
+    pixels (binned shifts × binning), so they can be reused on scans loaded
+    with any binning."""
+    full = np.asarray(shifts_binned, float) * binning
+    with open(path, "w") as fh:
+        fh.write("# xanes2d-analysis registration shifts\n")
+        fh.write("# dy_px, dx_px: shift applied to each image, in full-resolution "
+                 "pixels (rows, columns)\n")
+        for line in header:
+            fh.write(f"# {line}\n")
+        fh.write("energy_eV,dy_px,dx_px\n")
+        for e, (dy, dx) in zip(energy, full):
+            fh.write(f"{e:.4f},{dy:.4f},{dx:.4f}\n")
+
+
+def load_shifts(path: str):
+    """Read a shifts CSV written by save_shifts. Returns (energy_eV, (N, 2)
+    full-resolution shifts)."""
+    rows = []
+    with open(path) as fh:
+        for line in fh:
+            parts = line.strip().split(",")
+            if len(parts) < 3:
+                continue
+            try:
+                rows.append([float(p) for p in parts[:3]])
+            except ValueError:
+                continue                         # header / comment
+    if not rows:
+        raise ValueError(f"no shifts found in {os.path.basename(path)}")
+    a = np.array(rows, float)
+    order = np.argsort(a[:, 0])
+    return a[order, 0], a[order, 1:3]
+
+
+def shifts_for_scan(scan_energy: np.ndarray, binning: int, e_saved: np.ndarray,
+                    shifts_full: np.ndarray):
+    """Saved full-resolution shifts → shifts for a scan's energies at its
+    binning. Energies are matched by linear interpolation; outside the saved
+    range the nearest saved value is used. Returns (shifts (N, 2) in the
+    scan's binned pixels, number of scan energies outside the saved range)."""
+    out = np.column_stack([np.interp(scan_energy, e_saved, shifts_full[:, k])
+                           for k in (0, 1)]) / float(binning)
+    outside = int(np.sum((scan_energy < e_saved[0] - 1e-6) | (scan_energy > e_saved[-1] + 1e-6)))
+    return out, outside
