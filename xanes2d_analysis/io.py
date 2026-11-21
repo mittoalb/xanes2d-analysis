@@ -79,6 +79,14 @@ def load_scan(path: str, binning: int = 1, dark: float = 0.0,
         info = {k: (v.decode() if isinstance(v, bytes) else v)
                 for k, v in f.attrs.items() if k != "scan_config"}
         info["n_flats"] = int(flat.shape[0])
+        # Pixel size recorded at scan time (32id:TXMOptics:ImagePixelSize) —
+        # shown for reference only; it is not always right.
+        zp = f.get("measurement/instrument/zone_plate_and_optics")
+        if zp is not None and "image_pixel_size_nm" in zp.attrs:
+            try:
+                info["file_pixel_nm"] = float(zp.attrs["image_pixel_size_nm"])
+            except (TypeError, ValueError):
+                pass
 
         flats = {}                       # cache: a reference may serve many images
         out = raw = None

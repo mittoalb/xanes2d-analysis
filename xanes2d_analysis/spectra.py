@@ -74,3 +74,60 @@ def write_csv(path: str, energy: np.ndarray, columns: dict,
         fh.write(",".join(names) + "\n")
         for row in data:
             fh.write(",".join(f"{v:.6g}" for v in row) + "\n")
+
+
+def _line_fit_all(e: np.ndarray, y: np.ndarray, rng) -> Optional[np.ndarray]:
+    """Least-squares line a + b·E for every column of y (N, P) using only
+    energies inside rng. Returns (2, P) [a, b] or None if < 2 energies."""
+    m = (e >= rng[0]) & (e <= rng[1])
+    if m.sum() < 2:
+        return None
+    A = np.column_stack([np.ones(m.sum()), e[m]])
+    yy = np.where(np.isfinite(y[m]), y[m], 0.0)
+    coef, *_ = np.linalg.lstsq(A, yy, rcond=None)
+    return coef
+
+
+def edge_maps(e: np.ndarray, stack: np.ndarray, pre: Sequence[float],
+              post: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-pixel edge step and edge energy for a (N, H, W) absorption stack.
+
+    Every pixel's spectrum is normalised like `normalize` (pre-edge line
+    subtracted, divided by the step between the post- and pre-edge lines,
+    taken in the middle of the gap between the two ranges). The edge energy
+    is where the normalised spectrum (3-point smoothed along energy) first
+    crosses 0.5 between the end of the pre-edge range and the start of the
+    post-edge range, linearly interpolated. Pixels without a crossing get
+    NaN. Returns (step (H, W), edge energy (H, W) in eV)."""
+    e = np.asarray(e, float)
+    n, h, w = stack.shape
+    y = stack.reshape(n, -1).astype(np.float64)
+    c_pre, c_post = _line_fit_all(e, y, pre), _line_fit_all(e, y, post)
+    if c_pre is None or c_post is None:
+        nan = np.full((h, w), np.nan)
+        return nan, nan
+    e_mid = 0.5 * (pre[1] + post[0])
+    step = (c_post[0] + c_post[1] * e_mid) - (c_pre[0] + c_pre[1] * e_mid)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        norm = (y - (c_pre[0] + c_pre[1] * e[:, None])) / step
+    if n >= 3:                                     # light smoothing along energy
+        sm = norm.copy()
+        sm[1:-1] = (norm[:-2] + norm[1:-1] + norm[2:]) / 3.0
+        norm = sm
+    win = np.where((e >= pre[1]) & (e <= post[0]))[0]
+    e_half = np.full(h * w, np.nan)
+    if len(win) >= 2:
+        lo, hi = win[0], win[-1]
+        seg = norm[lo:hi + 1]
+        above = seg >= 0.5
+        has = above.any(axis=0) & ~above[0]        # starts below, crosses later
+        i = np.argmax(above, axis=0)               # first index at/above 0.5
+        cols = np.where(has)[0]
+        i1 = i[cols]
+        i0 = i1 - 1
+        y0, y1 = seg[i0, cols], seg[i1, cols]
+        ee = e[lo:hi + 1]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            frac = np.clip((0.5 - y0) / (y1 - y0), 0, 1)
+        e_half[cols] = ee[i0] + frac * (ee[i1] - ee[i0])
+    return step.reshape(h, w), e_half.reshape(h, w)

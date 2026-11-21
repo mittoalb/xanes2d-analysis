@@ -156,6 +156,150 @@ class ShiftsDialog(QtWidgets.QDialog):
         v.addWidget(bb)
 
 
+SCALEBAR_DEFAULTS = {"pixel_nm": 16.0, "length": 1.0, "unit": "µm", "color": "#ffffff",
+                     "thickness": 6, "font": 12, "position": "Bottom right"}
+POSITIONS = {"Bottom right": (-30, -30), "Bottom left": (30, -30),
+             "Top right": (-30, 30), "Top left": (30, 30)}
+
+
+class ScaleBarItem(pg.GraphicsWidgetAnchor, pg.GraphicsObject):
+    """Scale bar anchored to a corner of the view; its length is a fixed
+    distance in image pixels, so it follows zooming."""
+
+    def __init__(self):
+        pg.GraphicsObject.__init__(self)
+        pg.GraphicsWidgetAnchor.__init__(self)
+        self.setFlag(self.GraphicsItemFlag.ItemHasNoContents)
+        self.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
+        self.size_px, self.thickness, self.right, self.bottom = 100.0, 6, True, True
+        self.bar = QtWidgets.QGraphicsRectItem(self)
+        self.text = pg.TextItem(anchor=(0.5, 1))
+        self.text.setParentItem(self)
+
+    def boundingRect(self):
+        return QtCore.QRectF()
+
+    def attach(self, view):
+        self.setParentItem(view)
+        view.sigRangeChanged.connect(self.update_bar)
+
+    def configure(self, size_px, label, color, thickness, font_pt, position):
+        self.size_px, self.thickness = float(size_px), int(thickness)
+        c = QtGui.QColor(color)
+        self.bar.setPen(pg.mkPen(c))
+        self.bar.setBrush(pg.mkBrush(c))
+        self.text.setText(label)
+        self.text.setColor(c)
+        f = QtGui.QFont()
+        f.setPointSize(int(font_pt))
+        self.text.setFont(f)
+        off = POSITIONS.get(position, (-30, -30))
+        self.right, self.bottom = off[0] <= 0, off[1] <= 0
+        a = (1 if self.right else 0, 1 if self.bottom else 0)
+        if self.parentItem() is not None:
+            self.anchor(itemPos=a, parentPos=a, offset=off)
+        self.update_bar()
+
+    def update_bar(self, *_):
+        view = self.parentItem()
+        if view is None:
+            return
+        p1 = view.mapFromViewToItem(self, QtCore.QPointF(0, 0))
+        p2 = view.mapFromViewToItem(self, QtCore.QPointF(self.size_px, 0))
+        w = abs((p2 - p1).x())
+        x0 = -w if self.right else 0.0
+        y0 = -self.thickness if self.bottom else 0.0
+        self.bar.setRect(QtCore.QRectF(x0, y0, w, self.thickness))
+        self.text.setAnchor((0.5, 1) if self.bottom else (0.5, 0))
+        self.text.setPos(x0 + w / 2.0, y0 if self.bottom else y0 + self.thickness)
+
+
+def _settings() -> QtCore.QSettings:
+    return QtCore.QSettings("xanes2d-analysis", "xanes2d-analysis")
+
+
+def load_scalebar_settings() -> dict:
+    st, out = _settings(), dict(SCALEBAR_DEFAULTS)
+    for k, v in SCALEBAR_DEFAULTS.items():
+        val = st.value(f"scalebar/{k}", v)
+        out[k] = type(v)(val) if not isinstance(v, str) else str(val)
+    return out
+
+
+class ScaleBarDialog(QtWidgets.QDialog):
+    def __init__(self, parent, cfg: dict, binning: int, file_pixel_nm=None):
+        super().__init__(parent)
+        self.setWindowTitle("Scale bar")
+        self.cfg = dict(cfg)
+        f = QtWidgets.QFormLayout(self)
+        self.pixel = QtWidgets.QDoubleSpinBox()
+        self.pixel.setRange(0.01, 100000)
+        self.pixel.setDecimals(3)
+        self.pixel.setSuffix(" nm")
+        self.pixel.setValue(cfg["pixel_nm"])
+        self.eff = QtWidgets.QLabel()
+        self.pixel.valueChanged.connect(lambda v: self.eff.setText(
+            f"= {v * binning:g} nm per displayed pixel (binning {binning})"))
+        self.pixel.valueChanged.emit(self.pixel.value())
+        f.addRow("Pixel size (full resolution):", self.pixel)
+        f.addRow("", self.eff)
+        if file_pixel_nm:
+            note = QtWidgets.QLabel(f"The file recorded {file_pixel_nm:g} nm "
+                                    "(32id:TXMOptics:ImagePixelSize) — not used.")
+            note.setStyleSheet("color: #888;")
+            f.addRow("", note)
+        row = QtWidgets.QHBoxLayout()
+        self.length = QtWidgets.QDoubleSpinBox()
+        self.length.setRange(0.001, 100000)
+        self.length.setDecimals(3)
+        self.length.setValue(cfg["length"])
+        self.unit = QtWidgets.QComboBox()
+        self.unit.addItems(["nm", "µm", "mm"])
+        self.unit.setCurrentText(cfg["unit"])
+        row.addWidget(self.length)
+        row.addWidget(self.unit)
+        f.addRow("Length:", row)
+        self.color_btn = QtWidgets.QPushButton()
+        self._set_color(cfg["color"])
+        self.color_btn.clicked.connect(self._pick_color)
+        f.addRow("Colour:", self.color_btn)
+        self.thick = QtWidgets.QSpinBox()
+        self.thick.setRange(1, 50)
+        self.thick.setValue(cfg["thickness"])
+        self.thick.setSuffix(" px")
+        f.addRow("Thickness:", self.thick)
+        self.font = QtWidgets.QSpinBox()
+        self.font.setRange(6, 72)
+        self.font.setValue(cfg["font"])
+        self.font.setSuffix(" pt")
+        f.addRow("Text size:", self.font)
+        self.pos = QtWidgets.QComboBox()
+        self.pos.addItems(list(POSITIONS))
+        self.pos.setCurrentText(cfg["position"])
+        f.addRow("Position:", self.pos)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok |
+                                        QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        f.addRow(bb)
+
+    def _set_color(self, c):
+        self.cfg["color"] = c
+        self.color_btn.setText(c)
+        self.color_btn.setStyleSheet(f"background: {c}; color: {'#000' if QtGui.QColor(c).lightness() > 128 else '#fff'};")
+
+    def _pick_color(self):
+        c = QtWidgets.QColorDialog.getColor(QtGui.QColor(self.cfg["color"]), self)
+        if c.isValid():
+            self._set_color(c.name())
+
+    def values(self) -> dict:
+        return {"pixel_nm": self.pixel.value(), "length": self.length.value(),
+                "unit": self.unit.currentText(), "color": self.cfg["color"],
+                "thickness": self.thick.value(), "font": self.font.value(),
+                "position": self.pos.currentText()}
+
+
 class ReferenceDialog(QtWidgets.QDialog):
     """Pick a reference spectrum from the local library (IXAS XAS Data
     Library copy), download / update it, or open any file."""
@@ -307,6 +451,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.job: Optional[Job] = None
         self._levels_set = False
         self._n_roi = 0
+        self._maps = None                          # (step, edge energy) cache
+        self.scalebar = None
+        self.sb_cfg = load_scalebar_settings()
         self._build()
         self._set_enabled(False)
 
@@ -378,9 +525,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
         crow = QtWidgets.QHBoxLayout()
         self.display = QtWidgets.QComboBox()
-        self.display.addItems(["Absorption (−ln I/I0)", "Transmission (I/I0)"])
-        self.display.currentIndexChanged.connect(lambda _: self._show_frame(relevel=True))
+        self.display.addItems(["Absorption (−ln I/I0)", "Transmission (I/I0)",
+                               "Edge energy map", "Edge step map"])
+        self.display.setToolTip(
+            "Edge energy map: each pixel coloured by the energy where its spectrum "
+            "reaches half the edge step (pre/post-edge ranges from the plot).\n"
+            "Edge step map: size of the edge jump — where the element is.\n"
+            "Run them after registration.")
+        self.display.currentIndexChanged.connect(self._display_changed)
         crow.addWidget(self.display)
+        self.cmap = QtWidgets.QComboBox()
+        self.cmap.addItems(["turbo", "viridis", "plasma", "inferno", "CET-R4"])
+        self.cmap.setToolTip("Colour scale of the maps")
+        self.cmap.currentIndexChanged.connect(lambda _: self._show_frame(relevel=True))
+        crow.addWidget(self.cmap)
+        self.mask_lbl = QtWidgets.QLabel("  Mask step <")
+        crow.addWidget(self.mask_lbl)
+        self.mask = QtWidgets.QDoubleSpinBox()
+        self.mask.setRange(0, 100)
+        self.mask.setValue(15)
+        self.mask.setSuffix(" % of max")
+        self.mask.setToolTip("Pixels whose edge step is below this fraction of the largest "
+                             "step (99th percentile) are left blank in the edge-energy map.")
+        self.mask.valueChanged.connect(lambda _: self._show_frame(relevel=True))
+        crow.addWidget(self.mask)
         crow.addWidget(QtWidgets.QLabel("  Point average"))
         self.pt_size = QtWidgets.QSpinBox()
         self.pt_size.setRange(1, 51)
@@ -397,6 +565,14 @@ class MainWindow(QtWidgets.QMainWindow):
                                        "visible at all energies.")
         self.reg_region_chk.toggled.connect(self._toggle_reg_region)
         crow.addWidget(self.reg_region_chk)
+        self.sb_chk = QtWidgets.QCheckBox("Scale bar")
+        self.sb_chk.toggled.connect(lambda _: self._update_scalebar())
+        crow.addWidget(self.sb_chk)
+        self.sb_btn = QtWidgets.QToolButton()
+        self.sb_btn.setText("…")
+        self.sb_btn.setToolTip("Scale bar settings: pixel size, length, colour, size, position")
+        self.sb_btn.clicked.connect(self.scalebar_dialog)
+        crow.addWidget(self.sb_btn)
         lv.addLayout(crow)
 
         rrow = QtWidgets.QHBoxLayout()
@@ -432,7 +608,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pre_region = pg.LinearRegionItem(brush=(80, 80, 255, 40))
         self.post_region = pg.LinearRegionItem(brush=(255, 80, 80, 40))
         for r in (self.pre_region, self.post_region):
-            r.sigRegionChangeFinished.connect(self._replot_all)
+            r.sigRegionChangeFinished.connect(self._ranges_changed)
         rv.addWidget(self.plot, 3)
 
         nrow = QtWidgets.QHBoxLayout()
@@ -494,8 +670,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_enabled(self, on: bool):
         for w in (self.act_reload, self.act_register, self.act_save, self.act_export,
                   self.btn_rect, self.btn_ellipse, self.btn_polygon, self.btn_keep,
-                  self.btn_remove, self.reg_region_chk, self.norm_chk, self.slider):
+                  self.btn_remove, self.reg_region_chk, self.norm_chk, self.slider,
+                  self.sb_chk, self.sb_btn):
             w.setEnabled(on)
+        self._map_controls()
 
     # ── jobs ────────────────────────────────────────────────────────────
     def _run(self, label, fn, done):
@@ -547,6 +725,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.point_spec = None
         self._n_roi = 0
         self._levels_set = False
+        self._maps = None
         self.slider.blockSignals(True)
         self.slider.setRange(0, scan.n - 1)
         self.slider.setValue(scan.n - 1)
@@ -558,6 +737,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_enabled(True)
         self._show_frame(relevel=True)
         self.vb.autoRange()
+        self._update_scalebar()
         self._replot_all()
 
     # ── image ───────────────────────────────────────────────────────────
@@ -582,6 +762,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.display.setItemText(1, "Transmission (I/I0)" if on else "Intensity (counts), raw")
         if self.scan is None:
             return
+        self._maps = None
         self._show_frame(relevel=True)
         for sp in self.spectra:
             self._update_spectrum(sp)
@@ -592,10 +773,80 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot.setLabel("left", ("Normalized " + base[0].lower() + base[1:])
                            if self.norm_chk.isChecked() else base)
 
+    def _map_mode(self) -> int:
+        """0 = image, 1 = edge-energy map, 2 = edge-step map."""
+        return max(0, self.display.currentIndex() - 1) if self.display.currentIndex() >= 2 else 0
+
+    def _map_controls(self):
+        m = self._map_mode()
+        self.cmap.setVisible(m > 0)
+        self.mask_lbl.setVisible(m == 1)
+        self.mask.setVisible(m == 1)
+        self.slider.setEnabled(self.scan is not None and m == 0)
+
+    def _display_changed(self, _=None):
+        self._map_controls()
+        # the maps use the pre/post-edge ranges: show them on the plot
+        show = self._map_mode() > 0 or self.norm_chk.isChecked()
+        for r in (self.pre_region, self.post_region):
+            if show and r.scene() is None:
+                self.plot.addItem(r)
+            elif not show and r.scene() is not None:
+                self.plot.removeItem(r)
+        self._show_frame(relevel=True)
+
+    def _ranges_changed(self):
+        self._maps = None
+        self._replot_all()
+        if self._map_mode():
+            self._show_frame(relevel=True)
+
+    def _get_maps(self):
+        if self._maps is None and self.scan is not None:
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+            try:
+                if self._flat_on():
+                    stack = self.scan.od
+                else:
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        stack = -np.log(self.scan.raw)
+                self._maps = spectra.edge_maps(self.scan.energy, stack,
+                                               self.pre_region.getRegion(),
+                                               self.post_region.getRegion())
+            finally:
+                QtWidgets.QApplication.restoreOverrideCursor()
+        return self._maps
+
+    def _map_image(self):
+        step, e_half = self._get_maps()
+        if self._map_mode() == 2:
+            return step
+        ref = np.nanpercentile(step, 99) if np.isfinite(step).any() else 0
+        out = e_half.copy()
+        out[~(step >= ref * self.mask.value() / 100.0)] = np.nan
+        return out
+
     def _show_frame(self, i=None, relevel=False):
         if self.scan is None:
             return
         i = self.slider.value() if i is None or isinstance(i, bool) else i
+        mode = self._map_mode()
+        if mode:
+            frame = self._map_image()
+            try:
+                self.hist.gradient.setColorMap(pg.colormap.get(self.cmap.currentText()))
+            except Exception:
+                self.hist.gradient.loadPreset("viridis")
+            finite = frame[np.isfinite(frame)]
+            lo, hi = (np.percentile(finite, (2, 98)) if finite.size else (0, 1))
+            self.img.setImage(frame, levels=(lo, hi), autoLevels=False)
+            self._levels_set = False
+            what = "edge energy (eV)" if mode == 1 else "edge step"
+            self.e_lbl.setText(f"map: {what}")
+            self.e_line.hide()
+            return
+        if relevel or not self._levels_set:
+            self.hist.gradient.loadPreset("grey")
         frame = self._frame(i)
         if relevel or not self._levels_set:
             lo, hi = np.nanpercentile(frame, (1, 99))
@@ -604,7 +855,38 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.img.setImage(frame, autoLevels=False)
         self.e_lbl.setText(f"{self.scan.energy[i]:.2f} eV  ({i + 1}/{self.scan.n})")
+        self.e_line.show()
         self.e_line.setValue(self.scan.energy[i])
+
+    # ── scale bar ───────────────────────────────────────────────────────
+    def scalebar_dialog(self):
+        if self.scan is None:
+            return
+        dlg = ScaleBarDialog(self, self.sb_cfg, self.scan.binning,
+                             self.scan.info.get("file_pixel_nm"))
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            self.sb_cfg = dlg.values()
+            st = _settings()
+            for k, v in self.sb_cfg.items():
+                st.setValue(f"scalebar/{k}", v)
+            self.sb_chk.setChecked(True)
+            self._update_scalebar()
+
+    def _update_scalebar(self):
+        on = self.sb_chk.isChecked() and self.scan is not None
+        if self.scalebar is None:
+            if not on:
+                return
+            self.scalebar = ScaleBarItem()
+            self.scalebar.attach(self.vb)
+        self.scalebar.setVisible(on)
+        if not on:
+            return
+        c = self.sb_cfg
+        nm = c["length"] * {"nm": 1.0, "µm": 1e3, "mm": 1e6}[c["unit"]]
+        px = nm / (c["pixel_nm"] * self.scan.binning)          # in displayed pixels
+        self.scalebar.configure(px, f"{c['length']:g} {c['unit']}", c["color"],
+                                c["thickness"], c["font"], c["position"])
 
     def _on_hover(self, pos):
         if self.scan is None:
@@ -613,8 +895,15 @@ class MainWindow(QtWidgets.QMainWindow):
         r, c = int(p.y()), int(p.x())
         h, w = self.scan.od.shape[1:]
         if 0 <= r < h and 0 <= c < w:
-            v = self._frame(self.slider.value())[r, c]
-            self.statusBar().showMessage(f"row {r}, col {c}: {v:.4f}")
+            mode = self._map_mode()
+            if mode:
+                v = self._map_image()[r, c]
+                txt = (f"edge energy {v:.1f} eV" if mode == 1 else f"edge step {v:.3f}") \
+                    if np.isfinite(v) else "masked"
+                self.statusBar().showMessage(f"row {r}, col {c}: {txt}")
+            else:
+                v = self._frame(self.slider.value())[r, c]
+                self.statusBar().showMessage(f"row {r}, col {c}: {v:.4f}")
 
     def _on_click(self, ev):
         if self.scan is None or ev.button() != QtCore.Qt.LeftButton or ev.double():
@@ -790,8 +1079,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_rfactor()
 
     def _toggle_norm(self, on):
+        show = on or self._map_mode() > 0
         for r in (self.pre_region, self.post_region):
-            (self.plot.addItem if on else self.plot.removeItem)(r)
+            if show and r.scene() is None:
+                self.plot.addItem(r)
+            elif not show and r.scene() is not None:
+                self.plot.removeItem(r)
         self._set_plot_label()
         self._replot_all()
         self.plot.enableAutoRange()
@@ -919,6 +1212,7 @@ class MainWindow(QtWidgets.QMainWindow):
             def applied(sh):
                 prev = self.scan.shifts
                 self.scan.shifts = sh if prev is None else prev + sh
+                self._maps = None
                 self._show_frame()
                 for sp in self.spectra:
                     self._update_spectrum(sp)

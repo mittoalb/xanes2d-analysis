@@ -150,3 +150,16 @@ def test_xdi_reader_variants(tmp_path):
     # io.load_reference recognises XDI
     e2, mu2 = io.load_reference(str(tmp_path / "t.xdi"))
     assert np.allclose(mu2, mu, atol=1e-6)
+
+
+def test_edge_maps_separate_the_two_phases(scan_file):
+    path, (energies, drifts, disc_a, disc_b) = scan_file
+    s = io.load_scan(path)
+    registration.apply_shifts(s.od, registration.register_stack(s.od, s.n - 1))
+    step, e_half = spectra.edge_maps(s.energy, s.od, (8310, 8322), (8355, 8370))
+    a = ndimage.binary_erosion(disc_a, iterations=6)
+    b = ndimage.binary_erosion(disc_b, iterations=6)
+    bg = ~ndimage.binary_dilation(disc_a | disc_b, iterations=4)
+    assert abs(np.nanmedian(e_half[a]) - 8333) < 3
+    assert abs(np.nanmedian(e_half[b]) - 8345) < 3
+    assert np.nanmedian(step[a]) > 0.6 and abs(np.nanmedian(step[bg])) < 0.1
