@@ -14,6 +14,7 @@ import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from . import background as bgm
+from . import sam3_backend
 from . import io, refs, registration, spectra
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=True)
@@ -299,6 +300,58 @@ class ScaleBarDialog(QtWidgets.QDialog):
                 "unit": self.unit.currentText(), "color": self.cfg["color"],
                 "thickness": self.thick.value(), "font": self.font.value(),
                 "position": self.pos.currentText()}
+
+
+class Sam3Dialog(QtWidgets.QDialog):
+    """Where SAM 3 lives and how its result is used."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("SAM 3 settings")
+        st = _settings()
+        f = QtWidgets.QFormLayout(self)
+        row = QtWidgets.QHBoxLayout()
+        self.python = QtWidgets.QLineEdit(st.value("sam3/python", "") or "")
+        self.python.setPlaceholderText(sam3_backend.find_python() or "path to the SAM 3 environment's python")
+        browse = QtWidgets.QPushButton("…")
+        browse.clicked.connect(self._browse)
+        row.addWidget(self.python, 1)
+        row.addWidget(browse)
+        f.addRow("SAM 3 Python:", row)
+        self.score = QtWidgets.QDoubleSpinBox()
+        self.score.setRange(0, 1)
+        self.score.setSingleStep(0.05)
+        self.score.setValue(float(st.value("sam3/min_score", 0.5)))
+        f.addRow("Keep objects with score ≥", self.score)
+        self.ckpt = QtWidgets.QLineEdit(st.value("sam3/checkpoint", "") or "")
+        self.ckpt.setPlaceholderText("blank = download from Hugging Face (needs access)")
+        f.addRow("Checkpoint (optional):", self.ckpt)
+        self.timeout = QtWidgets.QSpinBox()
+        self.timeout.setRange(10, 7200)
+        self.timeout.setSuffix(" s")
+        self.timeout.setValue(int(st.value("sam3/timeout", 600)))
+        f.addRow("Timeout:", self.timeout)
+        help_lbl = QtWidgets.QLabel(sam3_backend.SETUP_HELP)
+        help_lbl.setStyleSheet("color: #888; font-family: monospace;")
+        help_lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        f.addRow(help_lbl)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(self._save)
+        bb.rejected.connect(self.reject)
+        f.addRow(bb)
+
+    def _browse(self):
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "SAM 3 environment's python",
+                                                     os.path.expanduser("~"))
+        if p:
+            self.python.setText(p)
+
+    def _save(self):
+        st = _settings()
+        st.setValue("sam3/python", self.python.text().strip())
+        st.setValue("sam3/min_score", self.score.value())
+        st.setValue("sam3/checkpoint", self.ckpt.text().strip())
+        st.setValue("sam3/timeout", self.timeout.value())
+        self.accept()
 
 
 class ReferenceDialog(QtWidgets.QDialog):
@@ -587,6 +640,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
         brow = QtWidgets.QHBoxLayout()
         brow.addWidget(QtWidgets.QLabel("Background:"))
+        self.seg_method = QtWidgets.QComboBox()
+        self.seg_method.addItems(["Threshold", "SAM 3"])
+        self.seg_method.setToolTip("How Find sample segments the sample in the post-edge image:\n"
+                                   "Threshold — automatic (Otsu) threshold, editable;\n"
+                                   "SAM 3 — Meta's Segment Anything 3 with a text prompt "
+                                   "(needs a SAM 3 environment, see …).")
+        self.seg_method.currentIndexChanged.connect(lambda _: self._bg_controls())
+        brow.addWidget(self.seg_method)
+        self.sam_prompt = QtWidgets.QLineEdit("particle")
+        self.sam_prompt.setMaximumWidth(140)
+        self.sam_prompt.setToolTip("What SAM 3 should find (text prompt), e.g. particle, cell, grain")
+        brow.addWidget(self.sam_prompt)
+        self.sam_btn = QtWidgets.QToolButton()
+        self.sam_btn.setText("…")
+        self.sam_btn.setToolTip("SAM 3 settings (environment, score, checkpoint)")
+        self.sam_btn.clicked.connect(lambda: Sam3Dialog(self).exec_())
+        brow.addWidget(self.sam_btn)
         self.btn_find = QtWidgets.QPushButton("Find sample")
         self.btn_find.setToolTip("Segment the sample in the mean of the post-edge images (red "
                                  "range on the plot) with an automatic (Otsu) threshold.")
@@ -820,7 +890,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.scan is None:
             return
         self._maps = None
-        if self.sample_mask is not None:
+        if self.sample_mask is not None and not self._sam_mode():
             self.find_sample()           # other quantity → new threshold and mask
         self._show_frame(relevel=True)
         for sp in self.spectra:
@@ -920,10 +990,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.e_line.setValue(self.scan.energy[i])
 
     # ── background ──────────────────────────────────────────────────────
+    def _sam_mode(self) -> bool:
+        return self.seg_method.currentIndex() == 1
+
     def _bg_controls(self):
         has = self.sample_mask is not None
-        for wdg in (self.thr, self.bg_sub, self.bg_hide, self.bg_outline):
+        for wdg in (self.bg_sub, self.bg_hide, self.bg_outline):
             wdg.setEnabled(has)
+        sam = self._sam_mode()
+        self.thr.setEnabled(has and not sam)
+        self.sam_prompt.setVisible(sam)
+        self.sam_btn.setVisible(sam)
 
     def _active_abs_stack(self):
         """The absorption stack currently in use: -ln(I/I0) or -ln(I)."""
@@ -937,20 +1014,49 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._contrast = bgm.contrast_image(self.scan.energy, self._active_abs_stack(),
                                             self.post_region.getRegion())
+        if self._sam_mode():
+            self._find_sample_sam3()
+            return
         t = bgm.otsu_threshold(self._contrast)
         self.thr.blockSignals(True)
         self.thr.setValue(t)
         self.thr.blockSignals(False)
         self._segment()
 
+    def _find_sample_sam3(self):
+        st = _settings()
+        img, prompt = self._contrast, self.sam_prompt.text().strip() or "particle"
+        py = st.value("sam3/python", "") or None
+        score = float(st.value("sam3/min_score", 0.5))
+        ckpt = st.value("sam3/checkpoint", "") or None
+        timeout = float(st.value("sam3/timeout", 600))
+
+        def run(p, s):
+            return sam3_backend.segment(img, prompt, py, score, timeout, ckpt)
+
+        def done(res):
+            mask, n, scores = res
+            if not mask.any():
+                QtWidgets.QMessageBox.information(
+                    self, "SAM 3", f"SAM 3 found nothing for '{prompt}' with score ≥ {score:g} "
+                    f"(scores: {', '.join(f'{x:.2f}' for x in scores) or 'none'}). Try another "
+                    "prompt or a lower score in SAM 3 settings.")
+                return
+            self._set_mask(mask, f"SAM 3 '{prompt}': {n} object(s)")
+        self._run(f"SAM 3: segmenting '{prompt}' (loading the model can take a minute)…",
+                  run, done)
+
     def _segment(self):
-        if self.scan is None or self._contrast is None:
+        if self.scan is None or self._contrast is None or self._sam_mode():
             return
-        self.sample_mask = bgm.segment_sample(self._contrast, self.thr.value())
+        self._set_mask(bgm.segment_sample(self._contrast, self.thr.value()), "threshold")
+
+    def _set_mask(self, mask, how: str):
+        self.sample_mask = mask
         self._bg_cache = {}
         frac = 100.0 * self.sample_mask.mean()
         nbg = int(bgm.background_pixels(self.sample_mask).sum())
-        self.bg_info.setText(f"sample {frac:.0f}% of image, {nbg} background px")
+        self.bg_info.setText(f"{how}: sample {frac:.0f}% of image, {nbg} background px")
         self._bg_controls()
         self._draw_outline()
         self._bg_changed()
@@ -989,6 +1095,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """Mask and levels are stale (new scan / registration): drop them, or
         re-segment with the same threshold."""
         self._bg_cache = {}
+        if keep_threshold and self.sample_mask is not None and self._sam_mode():
+            keep_threshold = False
+            self.statusBar().showMessage("Sample moved: press Find sample again for a new SAM 3 mask.", 8000)
         if keep_threshold and self.sample_mask is not None and self.scan is not None:
             self._contrast = bgm.contrast_image(self.scan.energy, self._active_abs_stack(),
                                                 self.post_region.getRegion())
@@ -1446,8 +1555,10 @@ class MainWindow(QtWidgets.QMainWindow):
         b = self._bg_levels()
         if b is not None:
             nbg = int(bgm.background_pixels(self.sample_mask).sum())
+            how = (f"SAM 3 prompt '{self.sam_prompt.text()}'" if self._sam_mode()
+                   else f"threshold {self.thr.value():.4g}")
             header.append(f"background: subtracted per energy (median of {nbg} background px; "
-                          f"sample threshold {self.thr.value():.4g} on the post-edge mean); "
+                          f"sample from {how} on the post-edge mean); "
                           "column 'background' = subtracted level")
         norm = self.norm_chk.isChecked()
         if norm:

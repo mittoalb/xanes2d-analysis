@@ -204,3 +204,22 @@ def test_segmentation_and_background_removal(tmp_path):
     # background removal flattens it
     pre = s.energy < 8322
     assert np.std(cor_spec[pre]) < 0.3 * np.std(raw_spec[pre])
+
+
+def test_sam3_backend_plumbing_with_stand_in():
+    """Runs the real worker in a subprocess against a stand-in `sam3`
+    package with SAM 3's interface (tests/fake_sam3); the real model needs a
+    GPU environment with access to the checkpoints."""
+    from xanes2d_analysis import background as bgm, sam3_backend as sb
+    import tempfile
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "s.h5")
+    energies, drifts, disc_a, disc_b = make_file(p, drift_px=0)
+    s = io.load_scan(p)
+    img = bgm.contrast_image(s.energy, s.od, (8355, 8370))
+    env = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(__file__), "fake_sam3"))
+    mask, n, scores = sb.segment(img, "particle", python=sys.executable, env=env)
+    truth = disc_a | disc_b
+    assert n == 2 and (mask & truth).sum() / (mask | truth).sum() > 0.95
+    with pytest.raises(RuntimeError, match="SAM 3"):
+        sb.segment(img, python="/nonexistent/python")
